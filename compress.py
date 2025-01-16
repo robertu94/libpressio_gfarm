@@ -7,13 +7,19 @@ import os
 import math
 import copy
 import numpy as np
+import logging
 import libpressio as lp
+
+logger = logging.getLogger()
+logging.basicConfig(
+        format="%(levelname)s:%(filename)s:%(lineno)d: %(message)s",
+        level=int(os.environ.get("LIBPRESSIO_COMPRESS_LOGLEVEL", f"{logging.ERROR}")))
 
 DEFAULT_SCHEMA = {
     "default": {
         "compressor": {
-            "compressor_id": "blosc",
-            "compressor_config": {"pressio:lossless": 5, "blosc:compressor": "zstd"},
+            "compressor_id": "noop",
+            "compressor_config": {},
             "early_config": {}
         },
         "data_schema": {
@@ -42,14 +48,14 @@ io_index = 0
 def write_output(buf, id=""):
     global io_index
     ret =  sys.stdout.buffer.write(buf)
-    print(f"{io_index} wrote id={id} a={len(buf)}, r={ret}", file=sys.stderr)
+    logger.debug("%s wrote id=%s a=%s, r=%s", io_index, id, len(buf), ret)
     io_index += 1
     return ret
 
 def read_input(N, id=""):
     global io_index
     ret = sys.stdin.buffer.read(N)
-    print(f"{io_index} read id={id} a={N} r={len(ret)}", file=sys.stderr)
+    logger.debug("%s read id=%s a=%s r=%s", io_index, id, N, len(ret))
     io_index += 1
     return ret
 
@@ -60,7 +66,7 @@ def to_fill_block(v, blocksize):
     r = v % blocksize
     if r != 0:
         r = blocksize - r
-    print(f"to_fill_block r={r}, v={v} bs={blocksize}", file=sys.stderr)
+    logger.debug("to_fill_block r=%s, v=%s bs=%s", r, v, blocksize)
     return r
 
 def to_dtype(s: str):
@@ -83,12 +89,11 @@ if "compressor" not in default_schema:
 def decompress():
     while True:
         header_bytes = read_input(tarfile.BLOCKSIZE, id="header")
-        #print(f"header {header_bytes}", file=sys.stderr)
         try:
             header = tarfile.TarInfo.frombuf(header_bytes, tarfile.ENCODING, "surrogateescape")
         except tarfile.HeaderError:
             break
-        print(f"decoded {io_index} {header.get_info()}", file=sys.stderr)
+        logger.debug("decoded %s %s", io_index, header.get_info())
         if header.isfile():
             # determine decompression configuration
             if header.name in schema['override']:
@@ -109,7 +114,7 @@ def decompress():
             remaining = round_up(header.size, tarfile.BLOCKSIZE)
             data_parts = []
             while remaining > 0:
-                print(f"READING {header.name} {remaining=}", file=sys.stderr)
+                logger.info("READING %s reamaining=%s", header.name, remaining)
                 data = read_input(remaining, id="file_data")
                 remaining -= len(data)
                 data_parts.append(data)
@@ -122,10 +127,10 @@ def decompress():
             output = np.zeros(dims, dtype=to_dtype(dtype))
 
             #run decompression
-            print(header.name, "compressed=", full_data.shape, "output=", dims, dtype, config, file=sys.stderr)
+            logger.debug("%s compressed=%s %s %s %s", header.name, full_data.shape, dims, dtype, config)
             compressor = lp.PressioCompressor.from_config(config)
             output = compressor.decode(full_data, output)
-            print("finished_decompression", file=sys.stderr)
+            logger.debug("finished_decompression")
             #write_output the output output
             if isinstance(output, bytes):
                 l = len(output)
@@ -139,12 +144,12 @@ def decompress():
                 l = len(output_bytes)
                 decomp_header = copy.copy(header)
                 decomp_header.size = l
-                print("returning", decomp_header.get_info(), output.shape, output.dtype, file=sys.stderr)
+                logger.debug("returning %s %s %s", decomp_header.get_info(), output.shape, output.dtype)
                 write_output(decomp_header.tobuf(), id="ndarray_decompressed_header")
                 write_output(output_bytes, id="ndarray_decompressed_data")
                 write_output(b" " * to_fill_block(l, tarfile.BLOCKSIZE), id="ndarray_decompressed_padding")
             else:
-                print(header.name, dims, "compression did not produce bytes falling back to full data")
+                logger.debug("%s %s compression did not produce bytes falling back to full data")
                 write_output(full_data, id="failed_data")
 
         else:
@@ -159,14 +164,13 @@ def decompress():
 def compress():
     while True:
         header_bytes = read_input(tarfile.BLOCKSIZE, id="header")
-        #print(f"header {header_bytes}", file=sys.stderr)
         try:
             header = tarfile.TarInfo.frombuf(header_bytes, tarfile.ENCODING, "surrogateescape")
         except tarfile.HeaderError:
             # this should be the eof header entry
             write_output(header_bytes, id="eof header")
             break
-        print(f"decoded {io_index} {header.get_info()}", file=sys.stderr)
+        logger.debug("decoded %s %s", io_index, header.get_info())
         if header.isfile():
             # determine configuration
             if header.name in schema['override']:
@@ -187,7 +191,7 @@ def compress():
             remaining = round_up(header.size, tarfile.BLOCKSIZE)
             data_parts = []
             while remaining > 0:
-                print(f"READING {header.name} {remaining=}", file=sys.stderr)
+                logger.info("READING %s remaining=%s", header.name, remaining)
                 data = read_input(remaining, id="file_data")
                 remaining -= len(data)
                 data_parts.append(data)
@@ -200,7 +204,7 @@ def compress():
                 full_data_arr = full_data_arr.reshape(dims)
 
             #run the compressor
-            print(header.name, dims, dtype, full_data_arr.shape, full_data_arr.dtype, config, file=sys.stderr)
+            logger.debug("%s %s %s %s %s %s", header.name, dims, dtype, full_data_arr.shape, full_data_arr.dtype, config)
             compressor = lp.PressioCompressor.from_config(config)
             compressed = compressor.encode(full_data_arr)
 
@@ -210,7 +214,7 @@ def compress():
                 l = len(compressed)
                 comp_header = copy.copy(header)
                 comp_header.size = l
-                print("returning ", comp_header.get_info(), file=sys.stderr)
+                logger.debug("returning %s", comp_header.get_info())
                 write_output(comp_header.tobuf(), id="bytes_header")
                 write_output(compressed, id="bytes_compressed_data")
                 write_output(b" " * to_fill_block(l, tarfile.BLOCKSIZE), id="bytes_data_padding")
@@ -224,7 +228,7 @@ def compress():
                 write_output(compressed, id="ndarray_compressed_data")
                 write_output(b" " * to_fill_block(l, tarfile.BLOCKSIZE), id="ndarray_data_padding")
             else:
-                print(header.name, dims, "compression did not produce bytes falling back to full data")
+                logger.warning("%s %s compression did not produce bytes falling back to full data", header.name, dims)
                 write_output(full_data, id="failed_compression")
 
         else:
@@ -241,7 +245,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--decompress", help="run decompression on the tarfile", action="store_false", dest="compress")
     args = parser.parse_args()
-    print(args, file=sys.stderr)
+    logger.debug("%s", args)
     if args.compress:
         compress()
     else:
